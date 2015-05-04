@@ -6,20 +6,32 @@ let fs = require('fs')
 let mime = require('mime-types')
 let rimraf = require('rimraf')
 let mkdirp = require('mkdirp')
+let argv = require('yargs').argv
+let net = require('net')
+let jsonsocket = require('json-socket')
 
 require('songbird')
 
 const NODE_ENV = process.env.NODE_ENV
 const PORT = process.env.PORT || 8000
-const ROOT_DIR = path.resolve(process.cwd())
+const TCP_PORT = process.env.TCP_PORT || 8001
+const ROOT_DIR = argv.dir || path.resolve(process.cwd())
 
 let app = express()
+let tcp = net.createServer()
+let clients = [];
 
 if (NODE_ENV === 'development') {
 	app.use(morgan('dev'))
 }
 
 app.listen(PORT, ()=> console.log(`LISTENING @ http://127.0.0.0:${PORT}`))
+tcp.listen(TCP_PORT)
+
+tcp.on('connection', (socket) => {
+	console.log('new client connected')
+	clients.push(socket);
+})
 
 app.get('*', setFileMeta, sendHeaders, (req, res) => {
 		if (res.body) {
@@ -42,9 +54,11 @@ app.delete('*', setFileMeta, (req, res, next) => {
 		} else {
 			await fs.promise.unlink(req.filePath)
 		}
+		req.action = 'delete'
 		res.end()
+		next()
 	}().catch(next)
-})
+}, syncClients)
 
 app.put('*', setFileMeta, setDirDetails, (req, res, next) => {
 	async ()=> {
@@ -56,10 +70,12 @@ app.put('*', setFileMeta, setDirDetails, (req, res, next) => {
 
 		if(!req.isDir) {
 			req.pipe(fs.createWriteStream(req.filePath))
-		} 
+		}
+		req.action = 'create'
 		res.end()
+		next()
 	}().catch(next)	
-})
+}, syncClients)
 
 app.post('*', setFileMeta, setDirDetails, (req, res, next) => {
 	async ()=> {
@@ -74,9 +90,53 @@ app.post('*', setFileMeta, setDirDetails, (req, res, next) => {
 
 		await fs.promise.truncate(req.filePath, 0)
 		req.pipe(fs.createWriteStream(req.filePath))
+		req.action = 'update'
 		res.end()
+		next()
 	}().catch(next)	
-})
+}, syncClients)
+
+function syncClients(req, res, next) {
+	async ()=> {
+
+		if (clients.length === 0) {
+			next()
+		}
+		
+		let contents = null
+		let fileType = null
+
+		if (req.action !== 'delete') {
+			await fs.promise.readFile(req.filePath, 'utf-8')
+      			.then((fileContent) => {
+        			contents = fileContent
+      			})
+		}
+		
+		if (req.stat) {
+			fileType = req.stat.isDirectory() ? 'dir': 'file'
+		} else {
+			fileType = req.isDir ? 'dir' : 'file'
+		}
+
+		let packet = {
+			action: req.action,
+			path: req.url,
+			type: fileType,
+			contents: contents,
+			updated: Date.now()
+		}
+		
+		console.log("Packet sent:", packet)
+		
+		for (let i = 0; i < clients.length; i++) {
+			let socket = new jsonsocket(clients[i])
+			await socket.sendMessage(packet)
+		}
+
+		next()
+	}().catch(next)		
+}
 
 function setDirDetails(req, res, next) {
 	let filePath = req.filePath
@@ -114,4 +174,3 @@ function setFileMeta(req, res, next) {
 		.then(stat => req.stat = stat, ()=> req.stat = null)
 		.nodeify(next)
 }
-
